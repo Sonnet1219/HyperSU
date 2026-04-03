@@ -475,64 +475,69 @@ class HyperSU:
             sub_query_embeddings=sub_query_embeddings,
         )
 
-        # ── Backward seed extraction from dense-retrieval top passages ──
+        # ── Backward expansion (skipped when disable_backward is set) ──
         dense_sims = np.dot(self._passage_embeddings, query_embedding)
-        top_passage_indices = np.argsort(dense_sims)[::-1][:self.config.backward_seed_top_k]
 
-        bw_seed_map = {}  # entity_hash_id -> (entity_idx, score)
-        for p_idx in top_passage_indices:
-            p_hash_id = self._passage_hash_ids[int(p_idx)]
-            p_score = float(dense_sims[p_idx])
-            if p_hash_id not in self.knowledge_graph.edge_weights:
-                continue
-            for entity_hash_id in self.knowledge_graph.edge_weights[p_hash_id]:
-                if entity_hash_id in forward_activated:
+        if self.config.disable_backward:
+            su_scores = dict(forward_su_scores)
+            logger.info("Backward expansion disabled (ablation). Using forward SUs only (%d).",
+                        len(su_scores))
+        else:
+            # ── Backward seed extraction from dense-retrieval top passages ──
+            top_passage_indices = np.argsort(dense_sims)[::-1][:self.config.backward_seed_top_k]
+
+            bw_seed_map = {}  # entity_hash_id -> (entity_idx, score)
+            for p_idx in top_passage_indices:
+                p_hash_id = self._passage_hash_ids[int(p_idx)]
+                p_score = float(dense_sims[p_idx])
+                if p_hash_id not in self.knowledge_graph.edge_weights:
                     continue
-                if entity_hash_id not in self.entity_embedding_store.hash_id_to_idx:
-                    continue
-                entity_idx = self.entity_embedding_store.hash_id_to_idx[entity_hash_id]
-                if entity_hash_id not in bw_seed_map or p_score > bw_seed_map[entity_hash_id][1]:
-                    bw_seed_map[entity_hash_id] = (entity_idx, p_score)
+                for entity_hash_id in self.knowledge_graph.edge_weights[p_hash_id]:
+                    if entity_hash_id in forward_activated:
+                        continue
+                    if entity_hash_id not in self.entity_embedding_store.hash_id_to_idx:
+                        continue
+                    entity_idx = self.entity_embedding_store.hash_id_to_idx[entity_hash_id]
+                    if entity_hash_id not in bw_seed_map or p_score > bw_seed_map[entity_hash_id][1]:
+                        bw_seed_map[entity_hash_id] = (entity_idx, p_score)
 
-        # ── Backward expansion ──
-        backward_su_scores = {}
-        if bw_seed_map:
-            bw_hash_ids = list(bw_seed_map.keys())
-            bw_indices = [bw_seed_map[h][0] for h in bw_hash_ids]
-            bw_scores = [bw_seed_map[h][1] for h in bw_hash_ids]
+            backward_su_scores = {}
+            if bw_seed_map:
+                bw_hash_ids = list(bw_seed_map.keys())
+                bw_indices = [bw_seed_map[h][0] for h in bw_hash_ids]
+                bw_scores = [bw_seed_map[h][1] for h in bw_hash_ids]
 
-            bw_config = copy.copy(self.config)
-            bw_config.expansion_max_hops = self.config.backward_max_hops
+                bw_config = copy.copy(self.config)
+                bw_config.expansion_max_hops = self.config.backward_max_hops
 
-            _, backward_su_scores = frontier_expansion(
-                config=bw_config,
-                hypergraph=self.knowledge_graph._hypergraph,
-                entity_hash_ids=self._entity_hash_ids,
-                su_embeddings=self._su_embeddings,
-                question_embedding=query_embedding,
-                seed_entity_indices=bw_indices,
-                seed_entity_hash_ids=bw_hash_ids,
-                seed_entity_scores=bw_scores,
-                su_hash_ids=self._su_hash_ids,
-                sub_query_embeddings=sub_query_embeddings,
+                _, backward_su_scores = frontier_expansion(
+                    config=bw_config,
+                    hypergraph=self.knowledge_graph._hypergraph,
+                    entity_hash_ids=self._entity_hash_ids,
+                    su_embeddings=self._su_embeddings,
+                    question_embedding=query_embedding,
+                    seed_entity_indices=bw_indices,
+                    seed_entity_hash_ids=bw_hash_ids,
+                    seed_entity_scores=bw_scores,
+                    su_hash_ids=self._su_hash_ids,
+                    sub_query_embeddings=sub_query_embeddings,
+                )
+
+            # ── SU-level meet: SUs traversed by both forward and backward ──
+            meeting_sus = set(forward_su_scores.keys()) & set(backward_su_scores.keys())
+            bonus = self.config.meeting_su_bonus
+
+            su_scores = {}
+            for su_hash_id, score in forward_su_scores.items():
+                if su_hash_id in meeting_sus:
+                    su_scores[su_hash_id] = score * bonus
+                else:
+                    su_scores[su_hash_id] = score
+
+            logger.info(
+                "Bidirectional: forward_sus=%d, backward_sus=%d, meeting_sus=%d",
+                len(forward_su_scores), len(backward_su_scores), len(meeting_sus),
             )
-
-        # ── SU-level meet: SUs traversed by both forward and backward ──
-        meeting_sus = set(forward_su_scores.keys()) & set(backward_su_scores.keys())
-        bonus = self.config.meeting_su_bonus
-
-        # Build final SU scores: forward scores + bonus for meeting SUs
-        su_scores = {}
-        for su_hash_id, score in forward_su_scores.items():
-            if su_hash_id in meeting_sus:
-                su_scores[su_hash_id] = score * bonus
-            else:
-                su_scores[su_hash_id] = score
-
-        logger.info(
-            "Bidirectional: forward_sus=%d, backward_sus=%d, meeting_sus=%d",
-            len(forward_su_scores), len(backward_su_scores), len(meeting_sus),
-        )
 
         # ── Passage scoring: top-m capped mean of SU scores + dense ──
         top_m = self.config.su_score_top_m

@@ -14,8 +14,8 @@ class HyperSUConfig:
     max_workers: int = 16
     retrieval_top_k: int = 5
     scoring_lambda: float = 0.5
-    expansion_max_hops: int = 3
-    expansion_top_k: int = 15
+    expansion_max_hops: int = 4
+    expansion_top_k: int = 30
     hop_decay: float = 0.5
     conductance_floor: float = 0.5
     conductance_gamma: float = 1.0
@@ -38,9 +38,11 @@ class HyperSUConfig:
     entity_merge_threshold: float = 0.90
     # Bidirectional expansion
     backward_seed_top_k: int = 10
-    backward_max_hops: int = 2
+    backward_max_hops: int = 3
     meeting_su_bonus: float = 2.0
     su_score_top_m: int = 3
+    # Ablation
+    disable_backward: bool = False
     # Planner
     use_planner: bool = False
     planner_model_name: str = "gpt-4o-mini"
