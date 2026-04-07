@@ -68,6 +68,21 @@ class KnowledgeGraph:
         self.passage_to_su_ids = {}
         self._hypergraph = None
 
+    def get_state(self) -> dict:
+        """Serialize graph state (excluding _hypergraph which is rebuilt at retrieval time)."""
+        return {
+            "edge_weights": dict(self.edge_weights),
+            "entity_to_su_ids": dict(self.entity_to_su_ids),
+            "passage_to_su_ids": dict(self.passage_to_su_ids),
+        }
+
+    def load_state(self, state: dict) -> None:
+        """Restore graph state from a previously saved dict."""
+        self.edge_weights = defaultdict(dict, state["edge_weights"])
+        self.entity_to_su_ids = dict(state["entity_to_su_ids"])
+        self.passage_to_su_ids = dict(state["passage_to_su_ids"])
+        self._hypergraph = None
+
     # ====== Indexing ======
 
     def build_node_edge_maps(self, passage_entities, su_entities):

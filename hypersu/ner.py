@@ -1,11 +1,13 @@
-"""LangExtract-based entity extraction for HyperSU."""
+"""Direct-LLM entity extraction for HyperSU."""
 
 from __future__ import annotations
 
+import json
 import logging
-import os
+import re
+from concurrent.futures import ThreadPoolExecutor
 
-import langextract as lx
+from tqdm import tqdm
 
 from hypersu.entity_normalization import (
     build_entity_embedding_text,
@@ -14,32 +16,13 @@ from hypersu.entity_normalization import (
     normalize_entity_name,
     normalize_entity_type,
 )
-from hypersu.utils import compute_mdhash_id
+from hypersu.utils import LLM_Model, compute_mdhash_id
 
 
 logger = logging.getLogger(__name__)
 
 
-def _extract_description_value(extraction) -> str | None:
-    """Read the best available local description from a LangExtract extraction."""
-    if extraction.description:
-        return extraction.description
-
-    attributes = extraction.attributes or {}
-    if not isinstance(attributes, dict):
-        return None
-
-    attr_description = attributes.get("description")
-    if isinstance(attr_description, str):
-        return attr_description
-    if isinstance(attr_description, list):
-        for value in attr_description:
-            if isinstance(value, str) and value.strip():
-                return value
-    return None
-
-
-LANGEXTRACT_PROMPT = """
+NER_SYSTEM_PROMPT = """\
 Extract only the key reusable entities from the text.
 
 Rules:
@@ -50,128 +33,179 @@ Rules:
 - Do not extract pronouns, generic references, vague abstractions, scene-setting objects, or long clause-like spans.
 - Do not return overlapping duplicates.
 - Use `extraction_class` as a coarse entity type.
-""".strip()
 
+Return a JSON array of objects, each with keys: "extraction_class", "extraction_text", "description".
+Do NOT wrap the JSON in markdown fences or add any other text."""
 
-LANGEXTRACT_EXAMPLES = [
-    lx.data.ExampleData(
-        text=(
+FEW_SHOT_EXAMPLES = [
+    {
+        "text": (
             "The travellers reached Kynance Cove before visiting "
             "Landewednack, where the rector welcomed them."
         ),
-        extractions=[
-            lx.data.Extraction(
-                extraction_class="location",
-                extraction_text="Kynance Cove",
-                description="coastal cove reached by the travellers",
-            ),
-            lx.data.Extraction(
-                extraction_class="location",
-                extraction_text="Landewednack",
-                description="Cornish village visited after the cove",
-            ),
-            lx.data.Extraction(
-                extraction_class="person",
-                extraction_text="the rector",
-                description="local rector who welcomed the visitors",
-            ),
+        "extractions": [
+            {
+                "extraction_class": "location",
+                "extraction_text": "Kynance Cove",
+                "description": "coastal cove reached by the travellers",
+            },
+            {
+                "extraction_class": "location",
+                "extraction_text": "Landewednack",
+                "description": "Cornish village visited after the cove",
+            },
+            {
+                "extraction_class": "person",
+                "extraction_text": "the rector",
+                "description": "local rector who welcomed the visitors",
+            },
         ],
-    ),
-    lx.data.ExampleData(
-        text=(
+    },
+    {
+        "text": (
             "The biopsy confirmed Hodgkin lymphoma, and the patient "
             "started ABVD chemotherapy."
         ),
-        extractions=[
-            lx.data.Extraction(
-                extraction_class="test",
-                extraction_text="biopsy",
-                description="diagnostic procedure confirming the disease",
-            ),
-            lx.data.Extraction(
-                extraction_class="medical_condition",
-                extraction_text="Hodgkin lymphoma",
-                description="disease diagnosis confirmed by biopsy",
-            ),
-            lx.data.Extraction(
-                extraction_class="treatment",
-                extraction_text="ABVD chemotherapy",
-                description="chemotherapy regimen started for treatment",
-            ),
+        "extractions": [
+            {
+                "extraction_class": "test",
+                "extraction_text": "biopsy",
+                "description": "diagnostic procedure confirming the disease",
+            },
+            {
+                "extraction_class": "medical_condition",
+                "extraction_text": "Hodgkin lymphoma",
+                "description": "disease diagnosis confirmed by biopsy",
+            },
+            {
+                "extraction_class": "treatment",
+                "extraction_text": "ABVD chemotherapy",
+                "description": "chemotherapy regimen started for treatment",
+            },
         ],
-    ),
+    },
 ]
 
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
-class LangExtractExtractor:
-    """LLM-backed entity extraction with grounded descriptions."""
 
-    def __init__(
-        self,
-        model_id: str = "gpt-4o-mini",
-        api_key: str | None = None,
-        model_url: str | None = None,
-        max_char_buffer: int = 1000,
-        extraction_passes: int = 1,
-        max_workers: int = 10,
-        use_schema_constraints: bool = True,
-    ):
+def _build_messages(text: str) -> list[dict]:
+    """Construct chat messages for entity extraction."""
+    messages = [{"role": "system", "content": NER_SYSTEM_PROMPT}]
+    for example in FEW_SHOT_EXAMPLES:
+        messages.append({"role": "user", "content": example["text"]})
+        messages.append({
+            "role": "assistant",
+            "content": json.dumps(example["extractions"], ensure_ascii=False),
+        })
+    messages.append({"role": "user", "content": text})
+    return messages
+
+
+def _parse_extractions(response_text: str) -> list[dict]:
+    """Parse LLM response into a list of extraction dicts."""
+    if not response_text:
+        return []
+    text = response_text.strip()
+    fence_match = _FENCE_RE.search(text)
+    if fence_match:
+        text = fence_match.group(1)
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse NER response as JSON: %.200s", response_text)
+        return []
+    if not isinstance(result, list):
+        logger.warning("NER response is not a JSON array: %.200s", response_text)
+        return []
+    valid = []
+    for item in result:
+        if isinstance(item, dict) and "extraction_text" in item:
+            valid.append(item)
+    return valid
+
+
+class DirectLLMExtractor:
+    """LLM-backed entity extraction via direct OpenAI API calls."""
+
+    def __init__(self, model_id: str = "gpt-4o-mini", max_workers: int = 10):
         self.model_id = model_id
-        self.api_key = api_key or os.getenv("LANGEXTRACT_API_KEY") or os.getenv("OPENAI_API_KEY")
-        self.model_url = model_url or os.getenv("OPENAI_BASE_URL")
-        self.max_char_buffer = max_char_buffer
-        self.extraction_passes = max(1, extraction_passes)
         self.max_workers = max(1, max_workers)
-        self.use_schema_constraints = use_schema_constraints
-
-        if self.model_id.startswith(("gpt-", "o1", "o3", "o4")) and not self.api_key:
-            raise ValueError(
-                "LangExtract extraction requires an API key. Set OPENAI_API_KEY or "
-                "LANGEXTRACT_API_KEY before indexing."
-            )
-
+        self.llm = LLM_Model(model_id)
         logger.info(
-            "LangExtract loaded: model=%s, max_char_buffer=%s, extraction_passes=%s, max_workers=%s",
+            "DirectLLMExtractor loaded: model=%s, max_workers=%s",
             self.model_id,
-            self.max_char_buffer,
-            self.extraction_passes,
             self.max_workers,
         )
 
-    def _extract_documents(self, documents):
-        return lx.extract(
-            text_or_documents=documents,
-            prompt_description=LANGEXTRACT_PROMPT,
-            examples=LANGEXTRACT_EXAMPLES,
-            model_id=self.model_id,
-            api_key=self.api_key,
-            model_url=self.model_url,
-            max_char_buffer=self.max_char_buffer,
-            extraction_passes=self.extraction_passes,
-            batch_length=max(self.max_workers, 10),
-            max_workers=self.max_workers,
-            use_schema_constraints=self.use_schema_constraints,
-            fetch_urls=False,
-            show_progress=False,
-            temperature=0.0,
+    def _extract_single_su(self, su_text: str) -> list[dict]:
+        """Extract entities from a single semantic unit text."""
+        messages = _build_messages(su_text)
+        response = self.llm.infer(messages)
+        return _parse_extractions(response)
+
+    def _build_mention_record(
+        self, raw_extraction: dict, passage_hash_id: str, su_hash_id: str
+    ) -> dict | None:
+        surface_text = (raw_extraction.get("extraction_text") or "").strip()
+        normalized_name = normalize_entity_name(surface_text)
+        entity_type = normalize_entity_type(raw_extraction.get("extraction_class"))
+        description = normalize_description(
+            raw_extraction.get("description"),
+            fallback_text=surface_text,
         )
 
-    def _extract_mentions_from_su_batch_once(
-        self, su_items, passage_hash_id: str
-    ) -> dict[str, list[dict]]:
-        """Run one batch extraction attempt for a set of semantic units."""
-        documents = [
-            lx.data.Document(text=su_text, document_id=su_hash_id)
-            for su_hash_id, su_text in su_items
-        ]
-        document_results = self._extract_documents(documents)
-        mentions_by_su = {su_hash_id: [] for su_hash_id, _ in su_items}
+        if is_low_value_mention(normalized_name, entity_type, description):
+            return None
 
-        for annotated_document in document_results:
-            su_hash_id = annotated_document.document_id
+        mention_seed = f"{passage_hash_id}|{su_hash_id}|{normalized_name}|None|None"
+        return {
+            "mention_id": compute_mdhash_id(mention_seed, prefix="men-"),
+            "passage_hash_id": passage_hash_id,
+            "su_hash_id": su_hash_id,
+            "surface_text": surface_text,
+            "normalized_name": normalized_name,
+            "entity_type": entity_type,
+            "description": description,
+            "char_start": None,
+            "char_end": None,
+            "grounded": False,
+        }
+
+    def extract_all_mentions(
+        self, all_su_items: list[tuple[str, str, str]],
+    ) -> dict[str, list[dict]]:
+        """Extract mentions for all semantic units concurrently.
+
+        Args:
+            all_su_items: list of (su_hash_id, su_text, passage_hash_id) tuples
+                across all passages.
+
+        Returns:
+            dict mapping su_hash_id -> list of mention dicts.
+        """
+        if not all_su_items:
+            return {}
+
+        mentions_by_su: dict[str, list[dict]] = {
+            su_hash_id: [] for su_hash_id, _, _ in all_su_items
+        }
+
+        def _process_one(item):
+            su_hash_id, su_text, passage_hash_id = item
+            try:
+                raw_extractions = self._extract_single_su(su_text)
+            except Exception as exc:
+                logger.warning(
+                    "NER extraction failed for SU %s in passage %s: %s",
+                    su_hash_id, passage_hash_id, exc,
+                )
+                return su_hash_id, []
+
+            mentions = []
             seen = set()
-            for extraction in annotated_document.extractions or []:
-                mention = self._build_mention_record(extraction, passage_hash_id, su_hash_id)
+            for raw in raw_extractions:
+                mention = self._build_mention_record(raw, passage_hash_id, su_hash_id)
                 if mention is None:
                     continue
                 dedupe_key = (
@@ -182,98 +216,38 @@ class LangExtractExtractor:
                 if dedupe_key in seen:
                     continue
                 seen.add(dedupe_key)
-                mentions_by_su.setdefault(su_hash_id, []).append(mention)
+                mentions.append(mention)
+            return su_hash_id, mentions
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            for su_hash_id, mentions in tqdm(
+                executor.map(_process_one, all_su_items),
+                total=len(all_su_items),
+                desc="NER Extraction",
+            ):
+                mentions_by_su[su_hash_id] = mentions
+
         return mentions_by_su
-
-    def _build_mention_record(self, extraction, passage_hash_id: str, su_hash_id: str):
-        surface_text = (extraction.extraction_text or "").strip()
-        normalized_name = normalize_entity_name(surface_text)
-        entity_type = normalize_entity_type(extraction.extraction_class)
-        description = normalize_description(
-            _extract_description_value(extraction),
-            fallback_text=surface_text,
-        )
-
-        if is_low_value_mention(normalized_name, entity_type, description):
-            return None
-
-        char_start = None
-        char_end = None
-        grounded = extraction.char_interval is not None
-        if grounded:
-            char_start = extraction.char_interval.start_pos
-            char_end = extraction.char_interval.end_pos
-
-        mention_seed = f"{passage_hash_id}|{su_hash_id}|{normalized_name}|{char_start}|{char_end}"
-        return {
-            "mention_id": compute_mdhash_id(mention_seed, prefix="men-"),
-            "passage_hash_id": passage_hash_id,
-            "su_hash_id": su_hash_id,
-            "surface_text": surface_text,
-            "normalized_name": normalized_name,
-            "entity_type": entity_type,
-            "description": description,
-            "char_start": char_start,
-            "char_end": char_end,
-            "grounded": grounded,
-        }
-
-    def extract_mentions_from_su_batch(self, su_items, passage_hash_id: str) -> dict[str, list[dict]]:
-        """Extract mentions for a batch of semantic units from one passage."""
-        if not su_items:
-            return {}
-        try:
-            return self._extract_mentions_from_su_batch_once(su_items, passage_hash_id)
-        except ValueError as exc:
-            if len(su_items) == 1:
-                su_hash_id, _ = su_items[0]
-                logger.warning(
-                    "LangExtract failed for semantic unit %s in passage %s; "
-                    "returning empty mentions. error=%s",
-                    su_hash_id,
-                    passage_hash_id,
-                    exc,
-                )
-                return {su_hash_id: []}
-
-            midpoint = max(1, len(su_items) // 2)
-            logger.warning(
-                "LangExtract batch extraction failed for %s semantic units in passage %s; "
-                "retrying with smaller batches. error=%s",
-                len(su_items),
-                passage_hash_id,
-                exc,
-            )
-            left_mentions = self.extract_mentions_from_su_batch(
-                su_items[:midpoint], passage_hash_id
-            )
-            right_mentions = self.extract_mentions_from_su_batch(
-                su_items[midpoint:], passage_hash_id
-            )
-            merged_mentions = {su_hash_id: [] for su_hash_id, _ in su_items}
-            merged_mentions.update(left_mentions)
-            merged_mentions.update(right_mentions)
-            return merged_mentions
 
     def extract_query_entities(self, query: str) -> list[dict]:
         """Extract query entities using the same schema as index-time mentions."""
         try:
-            result = self._extract_documents(query)
-        except ValueError as exc:
+            raw_extractions = self._extract_single_su(query)
+        except Exception as exc:
             logger.warning(
-                "LangExtract query extraction failed; continuing without query entities. "
-                "error=%s",
+                "NER query extraction failed; continuing without query entities. error=%s",
                 exc,
             )
             return []
+
         query_mentions = []
         seen = set()
-        for extraction in result.extractions or []:
-            surface_text = (extraction.extraction_text or "").strip()
+        for raw in raw_extractions:
+            surface_text = (raw.get("extraction_text") or "").strip()
             normalized_name = normalize_entity_name(surface_text)
-            entity_type = normalize_entity_type(extraction.extraction_class)
+            entity_type = normalize_entity_type(raw.get("extraction_class"))
             description = normalize_description(
-                _extract_description_value(extraction),
+                raw.get("description"),
                 fallback_text=surface_text,
             )
             if is_low_value_mention(normalized_name, entity_type, description):

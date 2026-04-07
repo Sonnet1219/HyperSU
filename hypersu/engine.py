@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
+import pickle
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -20,7 +22,7 @@ from hypersu.embedding_store import EmbeddingStore
 from hypersu.entity_normalization import merge_entity_mentions
 from hypersu.frontier import frontier_expansion
 from hypersu.knowledge_graph import KnowledgeGraph, dense_retrieval
-from hypersu.ner import LangExtractExtractor
+from hypersu.ner import DirectLLMExtractor
 from hypersu.planner import QueryPlanner
 from hypersu.reranker import QwenReranker
 from hypersu.utils import LLM_Model, compute_mdhash_id
@@ -55,14 +57,9 @@ class HyperSU:
         self.spacy_model = spacy.load(self.config.spacy_model)
         logger.info("spaCy sentence splitter loaded with model: %s", self.config.spacy_model)
 
-        self.ner_extractor = LangExtractExtractor(
-            model_id=self.config.langextract_model_id,
-            api_key=self.config.langextract_api_key,
-            model_url=self.config.langextract_model_url,
-            max_char_buffer=self.config.langextract_max_char_buffer,
-            extraction_passes=self.config.langextract_extraction_passes,
+        self.ner_extractor = DirectLLMExtractor(
+            model_id=self.config.ner_model_id,
             max_workers=self.config.max_workers,
-            use_schema_constraints=self.config.langextract_use_schema_constraints,
         )
 
         self.knowledge_graph = KnowledgeGraph()
@@ -108,9 +105,12 @@ class HyperSU:
 
     def index(self, docs):
         """Build the hypergraph index from documents."""
+        # Step 1: Passage embeddings (incremental, parquet-cached)
         self.passage_embedding_store.insert_text(docs)
         hash_id_to_passage = self.passage_embedding_store.get_hash_id_to_text()
+        current_passage_ids = sorted(hash_id_to_passage.keys())
 
+        # Step 2: NER cache (incremental, pickle-cached)
         cached_passage_to_su_ids, cached_su_data, uncached_passage_ids = \
             self._load_cached_extractions(hash_id_to_passage.keys())
         logger.info(
@@ -129,7 +129,9 @@ class HyperSU:
                 self.config.semantic_unit_percentile,
             )
 
-            total_su_count = 0
+            # Phase A: Chunking (serial, CPU-bound)
+            all_su_items = []  # (su_hash_id, su_text, passage_hash_id)
+            su_text_map = {}   # su_hash_id -> su_text
             for passage_hash_id, passage_text in tqdm(
                 new_hash_id_to_passage.items(),
                 desc="Semantic Unit Chunking",
@@ -140,7 +142,6 @@ class HyperSU:
                     self.embedding_model,
                     self.config.semantic_unit_percentile,
                 )
-                su_items = []
                 su_hash_ids = []
                 seen_su_ids = set()
                 for su_text in su_texts:
@@ -148,90 +149,121 @@ class HyperSU:
                     if su_hash_id in seen_su_ids:
                         continue
                     seen_su_ids.add(su_hash_id)
-                    su_items.append((su_hash_id, su_text))
                     su_hash_ids.append(su_hash_id)
+                    all_su_items.append((su_hash_id, su_text, passage_hash_id))
+                    su_text_map[su_hash_id] = su_text
                 cached_passage_to_su_ids[passage_hash_id] = su_hash_ids
-                total_su_count += len(su_items)
-
-                su_mentions = self.ner_extractor.extract_mentions_from_su_batch(
-                    su_items, passage_hash_id=passage_hash_id
-                )
-                for su_hash_id, su_text in su_items:
-                    cached_su_data[su_hash_id] = {
-                        "text": su_text,
-                        "mentions": su_mentions.get(su_hash_id, []),
-                    }
 
             logger.info(
                 "Created %s semantic units from %s passages (avg %.1f SU/passage)",
-                total_su_count,
+                len(all_su_items),
                 len(new_hash_id_to_passage),
-                total_su_count / max(len(new_hash_id_to_passage), 1),
+                len(all_su_items) / max(len(new_hash_id_to_passage), 1),
             )
+
+            # Phase B: NER extraction (global concurrent, IO-bound)
+            su_mentions = self.ner_extractor.extract_all_mentions(all_su_items)
+            for su_hash_id, su_text in su_text_map.items():
+                cached_su_data[su_hash_id] = {
+                    "text": su_text,
+                    "mentions": su_mentions.get(su_hash_id, []),
+                }
         else:
             logger.info("All passages already have cached extraction results; skipping extraction.")
 
         self._persist_extraction_data(cached_passage_to_su_ids, cached_su_data)
 
-        # Rebuild SU/entity stores from the extraction cache so the graph stays consistent.
-        self.su_embedding_store.clear()
-        self.entity_embedding_store.clear()
-        self.knowledge_graph = KnowledgeGraph()
+        # Step 3: Check if index.pkl is fresh
+        index_data = self._load_index_pkl()
+        is_fresh = (
+            index_data is not None
+            and index_data.get("passage_hash_ids") == current_passage_ids
+            and index_data.get("config_hash") == self._compute_config_hash()
+        )
 
-        su_text_by_hash = {
-            su_hash_id: payload["text"]
-            for su_hash_id, payload in cached_su_data.items()
-            if payload.get("text")
-        }
-        self.su_embedding_store.insert_text(list(su_text_by_hash.values()))
+        if is_fresh:
+            logger.info("Index cache is fresh; restoring from index.pkl")
+            self.entity_nodes_by_hash = index_data["entity_nodes"]
+            self.knowledge_graph.load_state(index_data["kg_state"])
+        else:
+            logger.info("Index cache is stale or missing; rebuilding...")
+            self.su_embedding_store.clear()
+            self.entity_embedding_store.clear()
+            self.knowledge_graph = KnowledgeGraph()
 
-        all_mentions = []
-        for payload in cached_su_data.values():
-            all_mentions.extend(payload.get("mentions", []))
+            su_text_by_hash = {
+                su_hash_id: payload["text"]
+                for su_hash_id, payload in cached_su_data.items()
+                if payload.get("text")
+            }
+            self.su_embedding_store.insert_text(list(su_text_by_hash.values()))
 
-        entity_nodes, passage_entities, su_entities, passage_entity_counts = \
-            merge_entity_mentions(
-                all_mentions,
-                su_text_by_hash,
-                self.embedding_model,
-                similarity_threshold=self.config.entity_merge_threshold,
-                batch_size=self.config.batch_size,
+            all_mentions = []
+            for payload in cached_su_data.values():
+                all_mentions.extend(payload.get("mentions", []))
+
+            entity_nodes, passage_entities, su_entities, passage_entity_counts = \
+                merge_entity_mentions(
+                    all_mentions,
+                    su_text_by_hash,
+                    self.embedding_model,
+                    similarity_threshold=self.config.entity_merge_threshold,
+                    batch_size=self.config.batch_size,
+                )
+
+            entity_texts = [node["embedding_text"] for node in entity_nodes]
+            self.entity_embedding_store.insert_text(entity_texts)
+
+            self.entity_nodes_by_hash = {}
+            for entity_node in entity_nodes:
+                entity_text = entity_node["embedding_text"]
+                entity_hash_id = self.entity_embedding_store.text_to_hash_id.get(entity_text)
+                if entity_hash_id:
+                    stored_node = dict(entity_node)
+                    stored_node["hash_id"] = entity_hash_id
+                    self.entity_nodes_by_hash[entity_hash_id] = stored_node
+
+            _, _, passage_to_entities, entity_to_su, _ = \
+                self.knowledge_graph.build_node_edge_maps(passage_entities, su_entities)
+
+            self.knowledge_graph.build_entity_su_mapping(
+                entity_to_su,
+                self.entity_embedding_store,
+                self.su_embedding_store,
+            )
+            self.knowledge_graph.link_entities_to_passages(
+                passage_to_entities,
+                self.passage_embedding_store,
+                self.entity_embedding_store,
+                passage_entity_counts=passage_entity_counts,
+            )
+            self.knowledge_graph.link_adjacent_passages(self.passage_embedding_store)
+            self.knowledge_graph.passage_to_su_ids = dict(cached_passage_to_su_ids)
+
+            self._save_index_pkl(
+                current_passage_ids, entity_nodes,
+                passage_entities, su_entities, passage_entity_counts,
             )
 
-        entity_texts = [node["embedding_text"] for node in entity_nodes]
-        self.entity_embedding_store.insert_text(entity_texts)
-        self._persist_entity_nodes(entity_nodes)
-
-        _, _, passage_to_entities, entity_to_su, _ = \
-            self.knowledge_graph.build_node_edge_maps(passage_entities, su_entities)
-
-        self.knowledge_graph.build_entity_su_mapping(
-            entity_to_su,
-            self.entity_embedding_store,
-            self.su_embedding_store,
-        )
-        self.knowledge_graph.link_entities_to_passages(
-            passage_to_entities,
-            self.passage_embedding_store,
-            self.entity_embedding_store,
-            passage_entity_counts=passage_entity_counts,
-        )
-        self.knowledge_graph.link_adjacent_passages(self.passage_embedding_store)
-        self.knowledge_graph.passage_to_su_ids = dict(cached_passage_to_su_ids)
+    # ---- NER cache (pickle) ----
 
     def _load_cached_extractions(self, passage_hash_ids):
-        self._ner_cache_path = os.path.join(self.config.save_dir, "ner_results.json")
-        if not os.path.exists(self._ner_cache_path):
+        pkl_path = os.path.join(self.config.save_dir, "ner_cache.pkl")
+        json_path = os.path.join(self.config.save_dir, "ner_results.json")
+
+        cached = None
+        if os.path.exists(pkl_path):
+            with open(pkl_path, "rb") as f:
+                cached = pickle.load(f)
+        elif os.path.exists(json_path):
+            with open(json_path, encoding="utf-8") as f:
+                cached = json.load(f)
+
+        if cached is None:
             return {}, {}, set(passage_hash_ids)
 
-        with open(self._ner_cache_path, encoding="utf-8") as handle:
-            cached = json.load(handle)
-
         if cached.get("schema_version") != 2:
-            logger.warning(
-                "Ignoring legacy extraction cache at %s because schema_version != 2",
-                self._ner_cache_path,
-            )
+            logger.warning("Ignoring extraction cache: schema_version != 2")
             return {}, {}, set(passage_hash_ids)
 
         passage_to_su_ids = cached.get("passage_hash_id_to_su_hash_ids", {})
@@ -240,43 +272,61 @@ class HyperSU:
         return passage_to_su_ids, su_to_data, uncached_ids
 
     def _persist_extraction_data(self, passage_to_su_ids, su_to_data):
-        os.makedirs(os.path.dirname(self._ner_cache_path), exist_ok=True)
-        with open(self._ner_cache_path, "w", encoding="utf-8") as handle:
-            json.dump(
+        pkl_path = os.path.join(self.config.save_dir, "ner_cache.pkl")
+        os.makedirs(os.path.dirname(pkl_path), exist_ok=True)
+        with open(pkl_path, "wb") as f:
+            pickle.dump(
                 {
                     "schema_version": 2,
                     "passage_hash_id_to_su_hash_ids": passage_to_su_ids,
                     "su_to_data": su_to_data,
                 },
-                handle,
-                ensure_ascii=False,
-                indent=2,
+                f,
+                protocol=pickle.HIGHEST_PROTOCOL,
             )
 
-    def _persist_entity_nodes(self, entity_nodes):
-        entity_nodes_path = os.path.join(self.config.save_dir, "entity_nodes.json")
-        self.entity_nodes_by_hash = {}
-        serializable_nodes = {}
-        for entity_node in entity_nodes:
-            entity_text = entity_node["embedding_text"]
-            entity_hash_id = self.entity_embedding_store.text_to_hash_id.get(entity_text)
-            if entity_hash_id is None:
-                continue
-            stored_node = dict(entity_node)
-            stored_node["hash_id"] = entity_hash_id
-            self.entity_nodes_by_hash[entity_hash_id] = stored_node
-            serializable_nodes[entity_hash_id] = stored_node
+    # ---- Index pickle (entity merge + KG state) ----
 
-        with open(entity_nodes_path, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "schema_version": 1,
-                    "entities": serializable_nodes,
-                },
-                handle,
-                ensure_ascii=False,
-                indent=2,
-            )
+    def _compute_config_hash(self) -> str:
+        key_parts = [
+            str(self.config.entity_merge_threshold),
+            str(self.config.semantic_unit_percentile),
+            self.config.ner_model_id,
+        ]
+        return hashlib.md5("|".join(key_parts).encode()).hexdigest()
+
+    def _save_index_pkl(self, passage_hash_ids, entity_nodes,
+                        passage_entities, su_entities, passage_entity_counts):
+        path = os.path.join(self.config.save_dir, "index.pkl")
+        data = {
+            "schema_version": 1,
+            "config_hash": self._compute_config_hash(),
+            "passage_hash_ids": passage_hash_ids,
+            "entity_nodes": dict(self.entity_nodes_by_hash),
+            "passage_entities": passage_entities,
+            "su_entities": su_entities,
+            "passage_entity_counts": passage_entity_counts,
+            "kg_state": self.knowledge_graph.get_state(),
+        }
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        logger.info("Saved index.pkl to %s", path)
+
+    def _load_index_pkl(self) -> dict | None:
+        path = os.path.join(self.config.save_dir, "index.pkl")
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+            if data.get("schema_version") != 1:
+                logger.warning("Ignoring index.pkl: unsupported schema_version")
+                return None
+            return data
+        except Exception as exc:
+            logger.warning("Failed to load index.pkl: %s", exc)
+            return None
 
     # ====== Retrieval ======
 
@@ -635,18 +685,18 @@ class HyperSU:
 
     GRAPHRAG_BENCH_SYSTEM_PROMPT = (
         "You are a careful reading comprehension assistant. You will receive several "
-        "passages from a specialized document and a factual question.\n\n"
-        "Rules:\n"
-        "1. Some passages may be irrelevant. Identify and ignore them.\n"
-        "2. Answer based ONLY on the passages. Do not add outside information.\n"
-        "3. Use the exact words and phrases from the passages — do not paraphrase.\n"
-        "4. Reuse key phrases from the question to frame your answer.\n"
-        "5. Be concise:\n"
-        "   - If the question asks for a specific entity (who, where, what name), "
+        "passages from a document and a question.\n\n"
+        "Instructions:\n"
+        "1. Some passages may be irrelevant. Identify and use only the relevant ones.\n"
+        "2. Synthesize information across passages when the question requires it.\n"
+        "3. Preserve key terms and proper nouns from the passages in your answer.\n"
+        "4. Answer in 1\u20132 concise sentences. Be direct \u2014 no hedging or filler.\n"
+        "5. If the question asks for a specific entity (who, where, what name), "
         "answer with just that entity or a short noun phrase.\n"
-        "   - Otherwise, answer in one sentence at most.\n"
-        "6. Do not explain, justify, or add any extra commentary.\n\n"
+        "6. Do not add information beyond what the passages support.\n"
+        "7. If the passages genuinely do not contain the answer, say so briefly.\n\n"
         "Format:\n"
+        "Reasoning: <which passages are relevant and how they connect>\n"
         "Answer: <your answer>"
     )
 

@@ -37,9 +37,7 @@ def parse_arguments():
     parser.add_argument("--dataset_name", type=str, default="novel", help="The dataset to use")
     parser.add_argument("--llm_model", type=str, default="gpt-4o-mini", help="The LLM model to use")
     parser.add_argument("--max_workers", type=int, default=16, help="The max number of workers to use")
-    parser.add_argument("--langextract_model", type=str, default="gpt-4o-mini", help="The LangExtract model to use")
-    parser.add_argument("--langextract_max_char_buffer", type=int, default=1000, help="Max char buffer per LangExtract call")
-    parser.add_argument("--langextract_extraction_passes", type=int, default=1, help="Sequential LangExtract passes per chunk")
+    parser.add_argument("--ner_model", type=str, default="gpt-4o-mini", help="The NER extraction model to use")
     parser.add_argument("--expansion_max_hops", type=int, default=3, help="Max BFS hops from seed entities")
     parser.add_argument("--expansion_top_k", type=int, default=15, help="New entities discovered per hop")
     parser.add_argument("--hop_decay", type=float, default=0.5, help="Score decay per hop")
@@ -113,9 +111,7 @@ def main():
         embedding_model_name=args.embedding_model,
         spacy_model=args.spacy_model,
         max_workers=args.max_workers,
-        langextract_model_id=args.langextract_model,
-        langextract_max_char_buffer=args.langextract_max_char_buffer,
-        langextract_extraction_passes=args.langextract_extraction_passes,
+        ner_model_id=args.ner_model,
         expansion_max_hops=args.expansion_max_hops,
         expansion_top_k=args.expansion_top_k,
         hop_decay=args.hop_decay,

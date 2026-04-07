@@ -53,9 +53,7 @@ def parse_arguments():
     parser.add_argument("--spacy_model", type=str, default="en_core_web_trf")
 
     # --- Entity extraction ---
-    parser.add_argument("--langextract_model", type=str, default="gpt-4o-mini")
-    parser.add_argument("--langextract_max_char_buffer", type=int, default=1000)
-    parser.add_argument("--langextract_extraction_passes", type=int, default=1)
+    parser.add_argument("--ner_model", type=str, default="gpt-4o-mini")
 
     # --- Chunking ---
     parser.add_argument("--chunk_size", type=int, default=1200, help="Token size for corpus chunking")
@@ -272,9 +270,7 @@ def main():
             reranker_candidate_top_k=args.reranker_candidate_top_k,
             reranker_batch_size=args.reranker_batch_size,
             reranker_max_length=args.reranker_max_length,
-            langextract_model_id=args.langextract_model,
-            langextract_max_char_buffer=args.langextract_max_char_buffer,
-            langextract_extraction_passes=args.langextract_extraction_passes,
+            ner_model_id=args.ner_model,
         )
 
         # Chunk corpus with semantic boundary awareness

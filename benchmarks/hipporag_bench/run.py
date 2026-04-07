@@ -126,9 +126,7 @@ def parse_arguments():
     parser.add_argument("--max_workers", type=int, default=16)
     parser.add_argument("--batch_size", type=int, default=128,
                         help="Embedding encode batch size (reduce if OOM)")
-    parser.add_argument("--langextract_model", type=str, default="gpt-4o-mini")
-    parser.add_argument("--langextract_max_char_buffer", type=int, default=1000)
-    parser.add_argument("--langextract_extraction_passes", type=int, default=1)
+    parser.add_argument("--ner_model", type=str, default="gpt-4o-mini")
     parser.add_argument("--expansion_max_hops", type=int, default=3)
     parser.add_argument("--expansion_top_k", type=int, default=15)
     parser.add_argument("--hop_decay", type=float, default=0.5)
@@ -178,9 +176,7 @@ def main():
         spacy_model=args.spacy_model,
         max_workers=args.max_workers,
         batch_size=args.batch_size,
-        langextract_model_id=args.langextract_model,
-        langextract_max_char_buffer=args.langextract_max_char_buffer,
-        langextract_extraction_passes=args.langextract_extraction_passes,
+        ner_model_id=args.ner_model,
         expansion_max_hops=args.expansion_max_hops,
         expansion_top_k=args.expansion_top_k,
         hop_decay=args.hop_decay,

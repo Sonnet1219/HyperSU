@@ -29,12 +29,7 @@ class HyperSUConfig:
         "Given a multi-hop question, judge whether the document contains evidence "
         "that helps answer the question, either directly or as an intermediate bridge."
     )
-    langextract_model_id: str = "gpt-4o-mini"
-    langextract_api_key: str | None = None
-    langextract_model_url: str | None = None
-    langextract_max_char_buffer: int = 1000
-    langextract_extraction_passes: int = 1
-    langextract_use_schema_constraints: bool = True
+    ner_model_id: str = "gpt-4o-mini"
     entity_merge_threshold: float = 0.90
     # Bidirectional expansion
     backward_seed_top_k: int = 10
