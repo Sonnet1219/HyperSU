@@ -1,7 +1,6 @@
-"""Standalone query planner for decomposing complex questions into sub-queries.
+"""Clue agent for decomposing complex questions into sub-queries.
 
-This module is intentionally not wired into HyperSU's main retrieval or QA
-pipeline. It can be imported independently or used as a small CLI utility.
+This module can be imported independently or used as a small CLI utility.
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ import json
 import re
 from typing import Any
 
-from hypersu.utils import LLM_Model
+from hypersu.llm import LLMClient
 
 
 PLANNER_SYSTEM_PROMPT = """
@@ -226,11 +225,11 @@ def _normalize_sub_queries(items: Any, original_query: str) -> list[PlannedSubQu
     ]
 
 
-class QueryPlanner:
-    """Standalone planner agent for complex-query decomposition."""
+class ClueAgent:
+    """Agent for decomposing complex queries into sub-queries."""
 
     def __init__(self, llm_model_name: str = "gpt-4o-mini", max_subqueries: int = 5):
-        self.llm_model = LLM_Model(llm_model_name)
+        self.llm_model = LLMClient(llm_model_name)
         self.max_subqueries = max(1, max_subqueries)
 
     def _build_messages(self, query: str, extra_context: str | None = None) -> list[dict[str, str]]:
@@ -271,8 +270,8 @@ class QueryPlanner:
 def plan_query(query: str, llm_model_name: str = "gpt-4o-mini",
                max_subqueries: int = 5, extra_context: str | None = None) -> QueryPlan:
     """Convenience wrapper for one-off planning."""
-    planner = QueryPlanner(llm_model_name=llm_model_name, max_subqueries=max_subqueries)
-    return planner.plan(query=query, extra_context=extra_context)
+    agent = ClueAgent(llm_model_name=llm_model_name, max_subqueries=max_subqueries)
+    return agent.plan(query=query, extra_context=extra_context)
 
 
 def _parse_args() -> argparse.Namespace:

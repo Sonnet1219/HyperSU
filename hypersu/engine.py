@@ -17,15 +17,22 @@ from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 from hypersu.chunker import create_semantic_units
+from hypersu.clue_agent import ClueAgent
 from hypersu.config import HyperSUConfig
 from hypersu.embedding_store import EmbeddingStore
-from hypersu.entity_normalization import merge_entity_mentions
+from hypersu.entity_merge import merge_entity_mentions
+from hypersu.extractor import Extractor
 from hypersu.frontier import frontier_expansion
 from hypersu.knowledge_graph import KnowledgeGraph, dense_retrieval
-from hypersu.ner import DirectLLMExtractor
-from hypersu.planner import QueryPlanner
+from hypersu.llm import LLMClient
+from hypersu.prompts import (
+    GRAPHRAG_BENCH_SYSTEM_PROMPT,
+    MULTIHOP_ONESHOT_ASSISTANT,
+    MULTIHOP_ONESHOT_USER,
+    MULTIHOP_SYSTEM_PROMPT,
+)
 from hypersu.reranker import QwenReranker
-from hypersu.utils import LLM_Model, compute_mdhash_id
+from hypersu.utils import compute_mdhash_id
 
 
 logger = logging.getLogger(__name__)
@@ -57,7 +64,7 @@ class HyperSU:
         self.spacy_model = spacy.load(self.config.spacy_model)
         logger.info("spaCy sentence splitter loaded with model: %s", self.config.spacy_model)
 
-        self.ner_extractor = DirectLLMExtractor(
+        self.extractor = Extractor(
             model_id=self.config.ner_model_id,
             max_workers=self.config.max_workers,
         )
@@ -66,7 +73,7 @@ class HyperSU:
         self.reranker = None
         self.planner = None
         if self.config.use_planner:
-            self.planner = QueryPlanner(
+            self.planner = ClueAgent(
                 llm_model_name=self.config.planner_model_name,
                 max_subqueries=self.config.planner_max_subqueries,
             )
@@ -77,7 +84,7 @@ class HyperSU:
     @property
     def llm_model(self):
         if self._llm_model is None:
-            self._llm_model = LLM_Model(self.config.llm_model_name)
+            self._llm_model = LLMClient(self.config.llm_model_name)
         return self._llm_model
 
     def _init_embedding_stores(self):
@@ -162,7 +169,7 @@ class HyperSU:
             )
 
             # Phase B: NER extraction (global concurrent, IO-bound)
-            su_mentions = self.ner_extractor.extract_all_mentions(all_su_items)
+            su_mentions = self.extractor.extract_all_mentions(all_su_items)
             for su_hash_id, su_text in su_text_map.items():
                 cached_su_data[su_hash_id] = {
                     "text": su_text,
@@ -467,7 +474,7 @@ class HyperSU:
         if len(self._entity_hash_ids) == 0 or self._entity_embeddings.size == 0:
             return [], [], [], [], []
 
-        query_mentions = self.ner_extractor.extract_query_entities(query)
+        query_mentions = self.extractor.extract_query_entities(query)
         if not query_mentions:
             return [], [], [], [], []
 
@@ -648,58 +655,6 @@ class HyperSU:
 
     # ====== QA ======
 
-    MULTIHOP_SYSTEM_PROMPT = (
-        "As an advanced reading comprehension assistant, your task is to analyze text passages "
-        "and corresponding questions meticulously. Your response start after \"Thought: \", "
-        "where you will methodically break down the reasoning process, illustrating how you "
-        "arrive at conclusions. Conclude with \"Answer: \" to present a concise, definitive "
-        "response, devoid of additional elaborations."
-    )
-
-    MULTIHOP_ONESHOT_USER = (
-        "[1] The Last Horse (Spanish:El último caballo) is a 1950 Spanish comedy film "
-        "directed by Edgar Neville starring Fernando Fernán Gómez.\n"
-        "[2] The University of Southampton, which was founded in 1862 and received its "
-        "Royal Charter as a university in 1952, has over 22,000 students. The university "
-        "is ranked in the top 100 research universities in the world in the Academic "
-        "Ranking of World Universities 2010. In 2010, the THES - QS World University "
-        "Rankings positioned the University of Southampton in the top 80 universities in "
-        "the world.\n"
-        "[3] Stanton Township is a township in Champaign County, Illinois, USA. As of "
-        "the 2010 census, its population was 505 and it contained 202 housing units.\n"
-        "[4] Neville A. Stanton is a British Professor of Human Factors and Ergonomics "
-        "at the University of Southampton. Prof Stanton is a Chartered Engineer (C.Eng), "
-        "Chartered Psychologist (C.Psychol) and Chartered Ergonomist (C.ErgHF). He has "
-        "written and edited over a forty books and over three hundered peer-reviewed "
-        "journal papers on applications of the subject.\n"
-        "[5] Finding Nemo Theatrical release poster Directed by Andrew Stanton Produced "
-        "by Graham Walters Screenplay by Andrew Stanton Bob Peterson David Reynolds.\n"
-        "\nQuestion: When was Neville A. Stanton's employer founded?\n"
-    )
-
-    MULTIHOP_ONESHOT_ASSISTANT = (
-        "Thought: The employer of Neville A. Stanton is University of Southampton. "
-        "The University of Southampton was founded in 1862.\n"
-        "Answer: 1862."
-    )
-
-    GRAPHRAG_BENCH_SYSTEM_PROMPT = (
-        "You are a careful reading comprehension assistant. You will receive several "
-        "passages from a document and a question.\n\n"
-        "Instructions:\n"
-        "1. Some passages may be irrelevant. Identify and use only the relevant ones.\n"
-        "2. Synthesize information across passages when the question requires it.\n"
-        "3. Preserve key terms and proper nouns from the passages in your answer.\n"
-        "4. Answer in 1\u20132 concise sentences. Be direct \u2014 no hedging or filler.\n"
-        "5. If the question asks for a specific entity (who, where, what name), "
-        "answer with just that entity or a short noun phrase.\n"
-        "6. Do not add information beyond what the passages support.\n"
-        "7. If the passages genuinely do not contain the answer, say so briefly.\n\n"
-        "Format:\n"
-        "Reasoning: <which passages are relevant and how they connect>\n"
-        "Answer: <your answer>"
-    )
-
     def rag_qa(self, queries, num_to_retrieve=None, qa_mode="multihop"):
         """Retrieve passages and generate answers for a list of queries.
 
@@ -710,9 +665,9 @@ class HyperSU:
         retrieval_results = self.retrieve(queries, num_to_retrieve)
 
         if qa_mode == "graphrag_bench":
-            system_prompt = self.GRAPHRAG_BENCH_SYSTEM_PROMPT
+            system_prompt = GRAPHRAG_BENCH_SYSTEM_PROMPT
         else:
-            system_prompt = self.MULTIHOP_SYSTEM_PROMPT
+            system_prompt = MULTIHOP_SYSTEM_PROMPT
 
         all_messages = []
         for result in retrieval_results:
@@ -729,8 +684,8 @@ class HyperSU:
             if qa_mode == "multihop":
                 messages = [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": self.MULTIHOP_ONESHOT_USER},
-                    {"role": "assistant", "content": self.MULTIHOP_ONESHOT_ASSISTANT},
+                    {"role": "user", "content": MULTIHOP_ONESHOT_USER},
+                    {"role": "assistant", "content": MULTIHOP_ONESHOT_ASSISTANT},
                     {"role": "user", "content": prompt_user},
                 ]
             else:

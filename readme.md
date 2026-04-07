@@ -48,7 +48,7 @@ export OPENAI_BASE_URL="your-base-url"
 python benchmarks/multihop/run.py \
   --dataset_name hotpotqa \
   --llm_model gpt-4o-mini \
-  --langextract_model gpt-4o-mini \
+  --ner_model gpt-4o-mini \
   --expansion_max_hops 3 \
   --expansion_top_k 15 \
   --scoring_lambda 0.7
@@ -57,7 +57,7 @@ python benchmarks/multihop/run.py \
 python benchmarks/graphrag_bench/run.py \
   --corpus_name medical \
   --llm_model gpt-4o-mini \
-  --langextract_model gpt-4o-mini \
+  --ner_model gpt-4o-mini \
   --expansion_max_hops 3 \
   --expansion_top_k 15
 ```

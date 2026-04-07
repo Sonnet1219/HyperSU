@@ -1,4 +1,3 @@
-from copy import deepcopy
 from hypersu.utils import compute_mdhash_id
 import pandas as pd
 import os
@@ -49,9 +48,9 @@ class EmbeddingStore:
             return
         all_embeddings = self.embedding_model.encode(texts_to_encode, normalize_embeddings=True, show_progress_bar=False, batch_size=self.batch_size)
 
-        self._upsert(missing_ids, texts_to_encode, all_embeddings)
+        self._insert_batch(missing_ids, texts_to_encode, all_embeddings)
 
-    def _upsert(self, hash_ids, texts, embeddings):
+    def _insert_batch(self, hash_ids, texts, embeddings):
         base_idx = len(self.hash_ids)
         self.hash_ids.extend(hash_ids)
         self.texts.extend(texts)
@@ -74,7 +73,7 @@ class EmbeddingStore:
         data_to_save.to_parquet(self.db_filename, index=False)
 
     def get_hash_id_to_text(self):
-        return deepcopy(self.hash_id_to_text)
+        return dict(self.hash_id_to_text)
 
     def clear(self):
         self.hash_ids = []

@@ -143,13 +143,13 @@ def _chunk_semantic(text, chunk_size, overlap_sents, nlp_model, embedding_model,
     return chunks
 
 
-def extract_sentences(text, nlp_model):
+def _extract_sentences(text, nlp_model):
     """Extract sentences from text using spaCy sentence segmentation."""
     doc = nlp_model(text)
     return [s.text.strip() for s in doc.sents if len(s.text.strip()) > 10]
 
 
-def kamradt_semantic_units(sentences, embeddings, percentile=60):
+def _kamradt_semantic_units(sentences, embeddings, percentile=60):
     """
     Kamradt Percentile semantic chunking.
 
@@ -297,7 +297,7 @@ def create_semantic_units(chunk_text, nlp_model, embedding_model, percentile=60,
     Returns:
         list[str]: List of semantic unit texts (each is 1+ joined sentences)
     """
-    sentences = extract_sentences(chunk_text, nlp_model)
+    sentences = _extract_sentences(chunk_text, nlp_model)
 
     if len(sentences) == 0:
         # Fallback: treat the whole chunk as one semantic unit
@@ -312,7 +312,7 @@ def create_semantic_units(chunk_text, nlp_model, embedding_model, percentile=60,
     )
 
     # Run Kamradt grouping
-    groups = kamradt_semantic_units(sentences, embeddings, percentile)
+    groups = _kamradt_semantic_units(sentences, embeddings, percentile)
 
     # Balance SU lengths
     groups = _balance_semantic_units(groups, sentences, embeddings, min_words, max_words)

@@ -1,40 +1,14 @@
+"""Utility functions for HyperSU."""
+
 from hashlib import md5
-import httpx
-from openai import OpenAI
-import re
-import string
 import logging
 import os
-from dotenv import load_dotenv
-
-load_dotenv()
+import re
+import string
 
 
 def compute_mdhash_id(content: str, prefix: str = "") -> str:
     return prefix + md5(content.encode()).hexdigest()
-
-
-class LLM_Model:
-    def __init__(self, llm_model):
-        http_client = httpx.Client(timeout=60.0, trust_env=False)
-        self.openai_client = OpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL"),
-            http_client=http_client
-        )
-        self.llm_config = {
-            "model": llm_model,
-            "max_tokens": 2000,
-            "temperature": 0,
-        }
-
-    def infer(self, messages):
-        try:
-            response = self.openai_client.chat.completions.create(**self.llm_config, messages=messages)
-            return response.choices[0].message.content
-        except Exception as e:
-            logging.getLogger(__name__).warning("LLM infer failed: %s", e)
-            return ""
 
 
 def normalize_answer(s):

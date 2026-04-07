@@ -182,8 +182,6 @@ def _cluster_similarity(cluster_a: dict, cluster_b: dict) -> float:
 
 
 def _can_merge(cluster_a: dict, cluster_b: dict, similarity: float) -> bool:
-    if cluster_a["entity_type"] != cluster_b["entity_type"]:
-        return False
     name_score = _cluster_similarity(cluster_a, cluster_b)
     if name_score < 0.72:
         return False

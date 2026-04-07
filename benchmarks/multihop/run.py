@@ -13,7 +13,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from hypersu.engine import HyperSU
-from hypersu.utils import LLM_Model, setup_logging
+from hypersu.llm import LLMClient
+from hypersu.utils import setup_logging
 from evaluate import Evaluator
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -142,7 +143,7 @@ def main():
     with open(f"{output_dir}/predictions.json", "w", encoding="utf-8") as f:
         json.dump(predictions, f, ensure_ascii=False, indent=4)
     if not args.skip_evaluation:
-        llm_model = LLM_Model(args.llm_model)
+        llm_model = LLMClient(args.llm_model)
         evaluator = Evaluator(llm_model=llm_model, predictions_path=f"{output_dir}/predictions.json")
         evaluator.evaluate(max_workers=args.max_workers)
 
