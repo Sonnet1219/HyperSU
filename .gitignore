@@ -2,6 +2,7 @@
 results/
 .env
 .venv
+.vscode
 dataset/
 import/
 model/
