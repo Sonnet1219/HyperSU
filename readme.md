@@ -12,6 +12,10 @@ Most graph-based RAG systems build pairwise entity-relation graphs via LLM extra
 
 **Bidirectional frontier expansion.** We run two concurrent propagation processes on the hypergraph. The *forward pass* seeds from query-linked entities and expands outward hop-by-hop: at each hop, activated entities scatter scores through conductance-gated hyperedges to discover new entities, retaining the top-K per round. The *backward pass* seeds from an answer candidate pool (entities anchored to high-confidence passages) and propagates inward along the same gating mechanism. SUs traversed by both directions receive a convergence bonus. This meet-in-the-middle design recovers reasoning paths that single-direction expansion cannot reach within bounded hops.
 
+## Architecture
+
+![HyperSU architecture](figure/image.png)
+
 ## How it works
 
 ### Indexing
